@@ -260,8 +260,12 @@ static void trace_vband(const float *curves, int curve_off,
 }
 
 // Lengyel's weighted dual-ray coverage combination
+// weight_boost: apply sqrt() to boost optical weight of thin features.
+// Matches SLUG_WEIGHT define in SlugPixelShader.hlsl.
+// Greatly improves legibility at small pixel sizes (8-20px).
 static inline float calc_coverage(float xcov, float ycov,
-                                    float xwgt, float ywgt) {
+                                    float xwgt, float ywgt,
+                                    int weight_boost) {
     float wsum = xwgt + ywgt;
     if (wsum < (1.0f / 65536.0f)) wsum = (1.0f / 65536.0f);
 
@@ -270,7 +274,13 @@ static inline float calc_coverage(float xcov, float ycov,
     float ay = fabsf(ycov);
     float conservative = (ax < ay) ? ax : ay;
     float result = (weighted > conservative) ? weighted : conservative;
-    return clamp01(result);
+    result = clamp01(result);
+
+    if (weight_boost) {
+        result = sqrtf(result);
+    }
+
+    return result;
 }
 
 // ============================================================================
@@ -294,6 +304,8 @@ typedef struct _slugfont_obj_t {
     uint16_t space_advance;
     uint16_t kern_count;
 
+    // Rendering options
+    uint8_t weight_boost;              // 1 = apply sqrt() for bolder thin features
     // Pointers into data buffer
     const uint8_t *glyph_dir;      // start of glyph directory
     const uint8_t *kern_table;     // start of kern table
@@ -399,6 +411,9 @@ static mp_obj_t slugfont_make_new(const mp_obj_type_t *type,
     self->band_pool = (const uint16_t *)(data + band_pool_off);
     self->curve_pool = (const float *)(data + curve_pool_off);
 
+    // Weight boost ON by default — essential for legibility at small sizes
+    self->weight_boost = 1;
+
     return MP_OBJ_FROM_PTR(self);
 }
 
@@ -498,7 +513,8 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
             trace_vband(self->curve_pool, c_off, v_count, v_bp,
                         self->band_pool, ex, ey, ppe_y, &ycov, &ywgt);
 
-            float coverage = calc_coverage(xcov, ycov, xwgt, ywgt);
+            float coverage = calc_coverage(xcov, ycov, xwgt, ywgt,
+                                          self->weight_boost);
 
             int col = glyph_left + px;
             if (col >= 0 && col < buf_w) {
@@ -674,6 +690,20 @@ static mp_obj_t slugfont_info(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(slugfont_info_obj, slugfont_info);
 
 // ============================================================================
+// METHOD: font.bold([value]) -> get/set weight boost (sqrt coverage)
+// No args: returns current state. With arg: sets it.
+// ============================================================================
+
+static mp_obj_t slugfont_bold(size_t n_args, const mp_obj_t *args) {
+    slugfont_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (n_args > 1) {
+        self->weight_boost = mp_obj_is_true(args[1]) ? 1 : 0;
+    }
+    return mp_obj_new_bool(self->weight_boost);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(slugfont_bold_obj, 1, 2, slugfont_bold);
+
+// ============================================================================
 // TYPE DEFINITION
 // ============================================================================
 
@@ -683,6 +713,7 @@ static const mp_rom_map_elem_t slugfont_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_metrics),      MP_ROM_PTR(&slugfont_metrics_obj) },
     { MP_ROM_QSTR(MP_QSTR_text_width),   MP_ROM_PTR(&slugfont_text_width_obj) },
     { MP_ROM_QSTR(MP_QSTR_info),         MP_ROM_PTR(&slugfont_info_obj) },
+    { MP_ROM_QSTR(MP_QSTR_bold),         MP_ROM_PTR(&slugfont_bold_obj) },
 };
 static MP_DEFINE_CONST_DICT(slugfont_locals_dict, slugfont_locals_dict_table);
 

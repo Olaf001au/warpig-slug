@@ -199,6 +199,7 @@ class SlugFont:
         with open(path, 'rb') as f:
             data = f.read()
         self._parse(data)
+        self.weight_boost = True  # sqrt() coverage boost, on by default
 
     def _parse(self, data):
         # Header
@@ -275,6 +276,15 @@ class SlugFont:
     def get_kern(self, cp_left, cp_right):
         """Get kerning value in font units between two codepoints."""
         return self.kerns.get((cp_left & 0xFFFF, cp_right & 0xFFFF), 0)
+
+    def bold(self, value=None):
+        """Get/set weight boost (sqrt coverage for optical boldness).
+        On by default — essential for legibility at small pixel sizes.
+        Matches SLUG_WEIGHT define in Lengyel's shader.
+        """
+        if value is not None:
+            self.weight_boost = bool(value)
+        return self.weight_boost
 
     def render_glyph(self, codepoint, px_size, buf, buf_w, buf_x=0, buf_y=0):
         """Render a single glyph into a grayscale buffer.
@@ -357,6 +367,10 @@ class SlugFont:
                     conservative = ay
                 cov = weighted if weighted > conservative else conservative
                 if cov > 1.0: cov = 1.0
+
+                # Weight boost: sqrt for optical boldness (Lengyel's SLUG_WEIGHT)
+                if self.weight_boost:
+                    cov = math.sqrt(cov)
 
                 col = glyph_left + px
                 if 0 <= col < buf_w:
@@ -502,22 +516,46 @@ def build_slugfont(ttf_path, output_path, chars=None, n_bands=8):
                 curves.append((cx, cy, (cx + nx) * 0.5, (cy + ny) * 0.5, nx, ny))
                 cx, cy = nx, ny
             elif op == 'qCurveTo':
-                off = [(a[0] - ox, a[1] - oy) for a in args[:-1]]
-                end = (args[-1][0] - ox, args[-1][1] - oy)
-                if len(off) == 0:
-                    curves.append((cx, cy, (cx + end[0]) * 0.5, (cy + end[1]) * 0.5,
-                                   end[0], end[1]))
-                elif len(off) == 1:
-                    curves.append((cx, cy, off[0][0], off[0][1], end[0], end[1]))
+                # Handle None endpoint: closed contour where ALL points are
+                # off-curve. fonttools uses None as the last arg to signal this.
+                # All on-curve points are implied midpoints between consecutive
+                # off-curve points, and the contour wraps around.
+                if args[-1] is None:
+                    # All args except last are off-curve control points
+                    off = [(a[0] - ox, a[1] - oy) for a in args[:-1]]
+                    # Generate implied on-curve points between all consecutive
+                    # off-curve points, wrapping around
+                    n = len(off)
+                    for i in range(n):
+                        # Start: midpoint between prev and current off-curve
+                        prev = off[(i - 1) % n]
+                        curr = off[i]
+                        nxt = off[(i + 1) % n]
+                        sx = (prev[0] + curr[0]) * 0.5
+                        sy = (prev[1] + curr[1]) * 0.5
+                        ex = (curr[0] + nxt[0]) * 0.5
+                        ey = (curr[1] + nxt[1]) * 0.5
+                        curves.append((sx, sy, curr[0], curr[1], ex, ey))
+                    # cx,cy = last implied on-curve (between last and first off-curve)
+                    cx = (off[-1][0] + off[0][0]) * 0.5
+                    cy = (off[-1][1] + off[0][1]) * 0.5
                 else:
-                    pts = [(cx, cy)] + off + [end]
-                    for i in range(1, len(pts) - 1):
-                        sx = pts[0][0] if i == 1 else (pts[i - 1][0] + pts[i][0]) * 0.5
-                        sy = pts[0][1] if i == 1 else (pts[i - 1][1] + pts[i][1]) * 0.5
-                        ex = pts[-1][0] if i == len(pts) - 2 else (pts[i][0] + pts[i + 1][0]) * 0.5
-                        ey = pts[-1][1] if i == len(pts) - 2 else (pts[i][1] + pts[i + 1][1]) * 0.5
-                        curves.append((sx, sy, pts[i][0], pts[i][1], ex, ey))
-                cx, cy = end
+                    off = [(a[0] - ox, a[1] - oy) for a in args[:-1]]
+                    end = (args[-1][0] - ox, args[-1][1] - oy)
+                    if len(off) == 0:
+                        curves.append((cx, cy, (cx + end[0]) * 0.5, (cy + end[1]) * 0.5,
+                                       end[0], end[1]))
+                    elif len(off) == 1:
+                        curves.append((cx, cy, off[0][0], off[0][1], end[0], end[1]))
+                    else:
+                        pts = [(cx, cy)] + off + [end]
+                        for i in range(1, len(pts) - 1):
+                            sx = pts[0][0] if i == 1 else (pts[i - 1][0] + pts[i][0]) * 0.5
+                            sy = pts[0][1] if i == 1 else (pts[i - 1][1] + pts[i][1]) * 0.5
+                            ex = pts[-1][0] if i == len(pts) - 2 else (pts[i][0] + pts[i + 1][0]) * 0.5
+                            ey = pts[-1][1] if i == len(pts) - 2 else (pts[i][1] + pts[i + 1][1]) * 0.5
+                            curves.append((sx, sy, pts[i][0], pts[i][1], ex, ey))
+                    cx, cy = end
             elif op == 'curveTo':
                 # Cubic approx: split at midpoint
                 p0x, p0y = cx, cy
