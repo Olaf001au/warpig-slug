@@ -536,6 +536,31 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
         }
     }
 
+    // Hole-fill pass: band boundaries can leave zero pixels surrounded by filled ones.
+    // Two passes — first fill 2+ neighbor holes, then catch any remaining.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int py = 1; py < gh_px - 1; py++) {
+            int row = by + glyph_top + py;
+            if (row < 1 || row >= (int)(buf_len / buf_w) - 1) continue;
+            for (int px = 1; px < gw_px - 1; px++) {
+                int col = glyph_left + px;
+                if (col < 1 || col >= buf_w - 1) continue;
+                size_t idx = (size_t)row * buf_w + col;
+                if (idx >= buf_len || buf[idx] != 0) continue;
+
+                uint8_t up    = buf[idx - buf_w];
+                uint8_t down  = buf[idx + buf_w];
+                uint8_t left  = buf[idx - 1];
+                uint8_t right = buf[idx + 1];
+                int count = (up > 0) + (down > 0) + (left > 0) + (right > 0);
+                if (count >= 2) {
+                    int sum = up + down + left + right;
+                    buf[idx] = (uint8_t)(sum / count);
+                }
+            }
+        }
+    }
+
     return mp_obj_new_int(adv_px);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(slugfont_render_glyph_obj, 7, 7, slugfont_render_glyph);
