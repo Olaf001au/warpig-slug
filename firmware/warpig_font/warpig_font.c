@@ -490,73 +490,82 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
 
     for (int py = 0; py < gh_px; py++) {
         float ey = (gh_px - 1 - py) * fu_per_px_y;
-
-        int hbi = (int)(ey / band_h);
-        if (hbi >= nb) hbi = nb - 1;
-        if (hbi < 0) hbi = 0;
-
-        // H-band: bands[hbi]
-        uint16_t h_count = rd_u16(band_ptr + hbi * BAND_ENTRY_SIZE);
-        uint16_t h_bp    = rd_u16(band_ptr + hbi * BAND_ENTRY_SIZE + 2);
-
         int row = by + glyph_top + py;
         if (row < 0) continue;
 
         for (int px = 0; px < gw_px; px++) {
             float ex = px * fu_per_px_x;
 
-            int vbi = (int)(ex / band_w);
-            if (vbi >= nb) vbi = nb - 1;
-            if (vbi < 0) vbi = 0;
+            // Sample at two offsets and take max — eliminates band boundary gaps
+            // Tiny jitter (1/16 pixel) is enough to dodge exact boundary zeros
+            float best = 0.0f;
+            for (int s = 0; s < 2; s++) {
+                float sx = ex + (s ? 0.0625f * fu_per_px_x : 0.0f);
+                float sy = ey + (s ? 0.0625f * fu_per_px_y : 0.0f);
 
-            // V-band: bands[nb + vbi]
-            int vband_off = (nb + vbi) * BAND_ENTRY_SIZE;
-            uint16_t v_count = rd_u16(band_ptr + vband_off);
-            uint16_t v_bp    = rd_u16(band_ptr + vband_off + 2);
+                int hbi2 = (int)(sy / band_h);
+                if (hbi2 >= nb) hbi2 = nb - 1;
+                if (hbi2 < 0) hbi2 = 0;
+                uint16_t hc = rd_u16(band_ptr + hbi2 * BAND_ENTRY_SIZE);
+                uint16_t hp = rd_u16(band_ptr + hbi2 * BAND_ENTRY_SIZE + 2);
 
-            float xcov, xwgt, ycov, ywgt;
-            trace_hband(self->curve_pool, c_off, h_count, h_bp,
-                        self->band_pool, ex, ey, ppe_x, &xcov, &xwgt);
-            trace_vband(self->curve_pool, c_off, v_count, v_bp,
-                        self->band_pool, ex, ey, ppe_y, &ycov, &ywgt);
+                int vbi = (int)(sx / band_w);
+                if (vbi >= nb) vbi = nb - 1;
+                if (vbi < 0) vbi = 0;
+                int voff = (nb + vbi) * BAND_ENTRY_SIZE;
+                uint16_t vc = rd_u16(band_ptr + voff);
+                uint16_t vp = rd_u16(band_ptr + voff + 2);
 
-            float coverage = calc_coverage(xcov, ycov, xwgt, ywgt,
-                                          self->weight_boost);
+                float xcov, xwgt, ycov, ywgt;
+                trace_hband(self->curve_pool, c_off, hc, hp,
+                            self->band_pool, sx, sy, ppe_x, &xcov, &xwgt);
+                trace_vband(self->curve_pool, c_off, vc, vp,
+                            self->band_pool, sx, sy, ppe_y, &ycov, &ywgt);
+                float c = calc_coverage(xcov, ycov, xwgt, ywgt,
+                                        self->weight_boost);
+                if (c > best) best = c;
+            }
 
             int col = glyph_left + px;
             if (col >= 0 && col < buf_w) {
                 size_t idx = (size_t)row * buf_w + col;
                 if (idx < buf_len) {
-                    int val = (int)(coverage * 255.0f + 0.5f);
+                    int val = (int)(best * 255.0f + 0.5f);
                     if (val > 255) val = 255;
-                    // Max-blend for overlapping glyphs
                     if (val > buf[idx]) buf[idx] = (uint8_t)val;
                 }
             }
         }
     }
 
-    // Hole-fill pass: band boundaries can leave zero pixels surrounded by filled ones.
-    // Two passes — first fill 2+ neighbor holes, then catch any remaining.
-    for (int pass = 0; pass < 2; pass++) {
-        for (int py = 1; py < gh_px - 1; py++) {
-            int row = by + glyph_top + py;
-            if (row < 1 || row >= (int)(buf_len / buf_w) - 1) continue;
-            for (int px = 1; px < gw_px - 1; px++) {
-                int col = glyph_left + px;
-                if (col < 1 || col >= buf_w - 1) continue;
-                size_t idx = (size_t)row * buf_w + col;
-                if (idx >= buf_len || buf[idx] != 0) continue;
+    // Patch isolated zero pixels inside glyph outlines.
+    // A hole is a zero pixel with 5+ of 8 neighbors filled AND at least 2
+    // strong (>96) cardinal neighbors. This catches interior gaps from the
+    // Slug algorithm without filling counters or creating edge halos.
+    for (int py = 1; py < gh_px - 1; py++) {
+        int row = by + glyph_top + py;
+        if (row < 1 || row >= (int)(buf_len / buf_w) - 1) continue;
+        for (int px = 1; px < gw_px - 1; px++) {
+            int col = glyph_left + px;
+            if (col < 1 || col >= buf_w - 1) continue;
+            size_t idx = (size_t)row * buf_w + col;
+            if (idx >= buf_len || buf[idx] != 0) continue;
 
-                uint8_t up    = buf[idx - buf_w];
-                uint8_t down  = buf[idx + buf_w];
-                uint8_t left  = buf[idx - 1];
-                uint8_t right = buf[idx + 1];
-                int count = (up > 0) + (down > 0) + (left > 0) + (right > 0);
-                if (count >= 2) {
-                    int sum = up + down + left + right;
-                    buf[idx] = (uint8_t)(sum / count);
-                }
+            uint8_t up    = buf[idx - buf_w];
+            uint8_t down  = buf[idx + buf_w];
+            uint8_t left  = buf[idx - 1];
+            uint8_t right = buf[idx + 1];
+
+            int n8 = (buf[idx - buf_w - 1] > 0) + (up > 0) +
+                     (buf[idx - buf_w + 1] > 0) + (left > 0) +
+                     (right > 0) + (buf[idx + buf_w - 1] > 0) +
+                     (down > 0) + (buf[idx + buf_w + 1] > 0);
+            int strong_card = (up > 96) + (down > 96) + (left > 96) + (right > 96);
+
+            if (n8 >= 5 && strong_card >= 2) {
+                int card_count = (up > 0) + (down > 0) + (left > 0) + (right > 0);
+                int sum = up + down + left + right;
+                buf[idx] = (card_count > 0) ? (uint8_t)(sum / card_count) : 128;
             }
         }
     }
