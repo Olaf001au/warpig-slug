@@ -529,15 +529,13 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
     int glyph_left = (int)(bx + lsb_px + 0.5f);
 
     // Bandless rendering — trace ALL curves per pixel.
-    // No band lookup = no band boundary artifacts.
-    // ~15-25 curves per glyph, fast enough on Cortex-M33 FPv5.
     for (int py = 0; py < gh_px; py++) {
-        float ey = (gh_px - 1 - py) * fu_per_px_y;
+        float ey = (float)by1 + ((float)(gh_px - 1 - py) + 0.5f) * fu_per_px_y;
         int row = by + glyph_top + py;
         if (row < 0) continue;
 
         for (int px = 0; px < gw_px; px++) {
-            float ex = px * fu_per_px_x;
+            float ex = (float)bx1 + ((float)px + 0.5f) * fu_per_px_x;
 
             float xcov, xwgt, ycov, ywgt;
             trace_h_all(self->curve_pool, c_off, c_cnt,
