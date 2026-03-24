@@ -168,20 +168,20 @@ static void solve_vert(float p1x, float p1y, float p2x, float p2y,
 }
 
 // Trace horizontal ray through band curves
-static void trace_hband(const float *curves, int curve_off,
-                         int count, int band_idx, const uint16_t *band_pool,
+static void trace_hband(const uint8_t *curves, int curve_off,
+                         int count, int band_idx, const uint8_t *band_pool,
                          float sx, float sy, float ppe,
                          float *out_cov, float *out_wgt) {
     float cov = 0.0f;
     float wgt = 0.0f;
 
     for (int i = 0; i < count; i++) {
-        int ci = band_pool[band_idx + i];
-        const float *c = &curves[(curve_off + ci) * CURVE_FLOATS];
+        int ci = rd_u16(band_pool + (band_idx + i) * 2);
+        const uint8_t *c = curves + (curve_off + ci) * CURVE_FLOATS * 4;
 
-        float p1x = c[0] - sx, p1y = c[1] - sy;
-        float p2x = c[2] - sx, p2y = c[3] - sy;
-        float p3x = c[4] - sx, p3y = c[5] - sy;
+        float p1x = rd_f32(c)      - sx, p1y = rd_f32(c + 4)  - sy;
+        float p2x = rd_f32(c + 8)  - sx, p2y = rd_f32(c + 12) - sy;
+        float p3x = rd_f32(c + 16) - sx, p3y = rd_f32(c + 20) - sy;
 
         // Early exit: curves sorted by descending max-x
         float mx = p1x;
@@ -215,20 +215,20 @@ static void trace_hband(const float *curves, int curve_off,
 }
 
 // Trace vertical ray through band curves (sign-flipped vs horizontal)
-static void trace_vband(const float *curves, int curve_off,
-                         int count, int band_idx, const uint16_t *band_pool,
+static void trace_vband(const uint8_t *curves, int curve_off,
+                         int count, int band_idx, const uint8_t *band_pool,
                          float sx, float sy, float ppe,
                          float *out_cov, float *out_wgt) {
     float cov = 0.0f;
     float wgt = 0.0f;
 
     for (int i = 0; i < count; i++) {
-        int ci = band_pool[band_idx + i];
-        const float *c = &curves[(curve_off + ci) * CURVE_FLOATS];
+        int ci = rd_u16(band_pool + (band_idx + i) * 2);
+        const uint8_t *c = curves + (curve_off + ci) * CURVE_FLOATS * 4;
 
-        float p1x = c[0] - sx, p1y = c[1] - sy;
-        float p2x = c[2] - sx, p2y = c[3] - sy;
-        float p3x = c[4] - sx, p3y = c[5] - sy;
+        float p1x = rd_f32(c)      - sx, p1y = rd_f32(c + 4)  - sy;
+        float p2x = rd_f32(c + 8)  - sx, p2y = rd_f32(c + 12) - sy;
+        float p3x = rd_f32(c + 16) - sx, p3y = rd_f32(c + 20) - sy;
 
         float my = p1y;
         if (p2y > my) my = p2y;
@@ -307,11 +307,11 @@ typedef struct _slugfont_obj_t {
 
     // Rendering options
     uint8_t weight_boost;              // 1 = apply sqrt() for bolder thin features
-    // Pointers into data buffer
+    // Pointers into data buffer (byte pointers to avoid alignment issues on ARM)
     const uint8_t *glyph_dir;      // start of glyph directory
     const uint8_t *kern_table;     // start of kern table
-    const uint16_t *band_pool;     // band index pool
-    const float *curve_pool;       // curve data pool
+    const uint8_t *band_pool;      // band index pool (u16 entries, read via rd_u16)
+    const uint8_t *curve_pool;     // curve data pool (f32 entries, read via rd_f32)
     size_t glyph_entry_size;       // bytes per glyph entry
 } slugfont_obj_t;
 
@@ -351,27 +351,36 @@ static mp_obj_t slugfont_make_new(const mp_obj_type_t *type,
                                    const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 1, 1, false);
 
-    // Read file into memory
-    mp_obj_t fobj = mp_builtin_open(1, &args[0], (mp_map_t *)&mp_const_empty_map);
-    const mp_stream_p_t *stream = mp_get_stream(fobj);
+    uint8_t *data;
+    size_t file_size;
 
-    // Get file size
-    struct mp_stream_seek_t seek = { .offset = 0, .whence = 2 };
-    stream->ioctl(fobj, MP_STREAM_SEEK, (mp_uint_t)(uintptr_t)&seek, NULL);
-    size_t file_size = seek.offset;
+    if (mp_obj_is_str(args[0])) {
+        // Path string — open file and call .read() method
+        // Avoids low-level stream seek which crashes on some VFS implementations
+        mp_obj_t open_args[2] = { args[0], mp_obj_new_str("rb", 2) };
+        mp_obj_t fobj = mp_builtin_open(2, open_args, (mp_map_t *)&mp_const_empty_map);
 
-    seek.offset = 0; seek.whence = 0;
-    stream->ioctl(fobj, MP_STREAM_SEEK, (mp_uint_t)(uintptr_t)&seek, NULL);
+        // Call .read() with no args to get all data
+        mp_obj_t read_func = mp_load_attr(fobj, MP_QSTR_read);
+        mp_obj_t data_obj = mp_call_function_n_kw(read_func, 0, 0, NULL);
 
-    // Allocate and read
-    uint8_t *data = m_malloc(file_size);
-    int err;
-    mp_uint_t read = stream->read(fobj, data, file_size, &err);
-    mp_stream_close(fobj);
+        // Close
+        mp_obj_t close_func = mp_load_attr(fobj, MP_QSTR_close);
+        mp_call_function_n_kw(close_func, 0, 0, NULL);
 
-    if (read != file_size) {
-        m_free(data);
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("read failed"));
+        // Copy data from returned bytes object
+        mp_buffer_info_t bufinfo;
+        mp_get_buffer_raise(data_obj, &bufinfo, MP_BUFFER_READ);
+        file_size = bufinfo.len;
+        data = m_malloc(file_size);
+        memcpy(data, bufinfo.buf, file_size);
+    } else {
+        // bytes/bytearray — use directly
+        mp_buffer_info_t bufinfo;
+        mp_get_buffer_raise(args[0], &bufinfo, MP_BUFFER_READ);
+        file_size = bufinfo.len;
+        data = m_malloc(file_size);
+        memcpy(data, bufinfo.buf, file_size);
     }
 
     // Validate magic
@@ -407,8 +416,8 @@ static mp_obj_t slugfont_make_new(const mp_obj_type_t *type,
     self->glyph_entry_size = GLYPH_FIXED_SIZE + self->n_bands * 2 * BAND_ENTRY_SIZE;
     self->glyph_dir = data + WARPSLUG_HEADER_SIZE;
     self->kern_table = self->glyph_dir + self->glyph_count * self->glyph_entry_size;
-    self->band_pool = (const uint16_t *)(data + band_pool_off);
-    self->curve_pool = (const float *)(data + curve_pool_off);
+    self->band_pool = data + band_pool_off;
+    self->curve_pool = data + curve_pool_off;
 
     // Weight boost ON by default — essential for legibility at small sizes
     self->weight_boost = 1;
