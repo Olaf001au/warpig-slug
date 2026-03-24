@@ -528,20 +528,56 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
     int glyph_top = baseline_y - (int)(by2 * scale + 0.5f);
     int glyph_left = (int)(bx + lsb_px + 0.5f);
 
-    // Bandless rendering — trace ALL curves per pixel.
+    // Use banded rendering when band data is available (fast path),
+    // fall back to bandless for fonts without bands or very few curves.
+    int nb = self->n_bands;
+    const uint8_t *band_ptr = g + GLYPH_FIXED_SIZE;
+    int use_bands = (nb > 0 && self->band_pool != NULL && c_cnt > 8);
+    float band_h = (nb > 0) ? (float)gh / nb : 1.0f;
+    float band_w = (nb > 0) ? (float)gw / nb : 1.0f;
+
     for (int py = 0; py < gh_px; py++) {
         float ey = (float)by1 + ((float)(gh_px - 1 - py) + 0.5f) * fu_per_px_y;
+        // Band-relative coordinate for band lookup
+        float ey_rel = ((float)(gh_px - 1 - py) + 0.5f) * fu_per_px_y;
         int row = by + glyph_top + py;
         if (row < 0) continue;
 
+        // H-band lookup (for banded path)
+        int hbi = 0;
+        uint16_t h_count = 0, h_bp = 0;
+        if (use_bands) {
+            hbi = (int)(ey_rel / band_h);
+            if (hbi >= nb) hbi = nb - 1;
+            if (hbi < 0) hbi = 0;
+            h_count = rd_u16(band_ptr + hbi * BAND_ENTRY_SIZE);
+            h_bp    = rd_u16(band_ptr + hbi * BAND_ENTRY_SIZE + 2);
+        }
+
         for (int px = 0; px < gw_px; px++) {
             float ex = (float)bx1 + ((float)px + 0.5f) * fu_per_px_x;
+            float ex_rel = ((float)px + 0.5f) * fu_per_px_x;
 
             float xcov, xwgt, ycov, ywgt;
-            trace_h_all(self->curve_pool, c_off, c_cnt,
-                        ex, ey, ppe_x, &xcov, &xwgt);
-            trace_v_all(self->curve_pool, c_off, c_cnt,
-                        ex, ey, ppe_y, &ycov, &ywgt);
+
+            if (use_bands) {
+                int vbi = (int)(ex_rel / band_w);
+                if (vbi >= nb) vbi = nb - 1;
+                if (vbi < 0) vbi = 0;
+                int voff = (nb + vbi) * BAND_ENTRY_SIZE;
+                uint16_t v_count = rd_u16(band_ptr + voff);
+                uint16_t v_bp    = rd_u16(band_ptr + voff + 2);
+
+                trace_hband(self->curve_pool, c_off, h_count, h_bp,
+                            self->band_pool, ex, ey, ppe_x, &xcov, &xwgt);
+                trace_vband(self->curve_pool, c_off, v_count, v_bp,
+                            self->band_pool, ex, ey, ppe_y, &ycov, &ywgt);
+            } else {
+                trace_h_all(self->curve_pool, c_off, c_cnt,
+                            ex, ey, ppe_x, &xcov, &xwgt);
+                trace_v_all(self->curve_pool, c_off, c_cnt,
+                            ex, ey, ppe_y, &ycov, &ywgt);
+            }
 
             float coverage = calc_coverage(xcov, ycov, xwgt, ywgt,
                                           self->weight_boost);
