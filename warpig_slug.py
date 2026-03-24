@@ -31,8 +31,8 @@ import time
 #   2B  line_gap (font units)
 #   2B  space_advance (font units)
 #   2B  kern_count
-#   4B  curve_pool_offset (byte offset from file start)
-#   2B  band_index_pool_offset (byte offset from file start, 0 = no band indices)
+#   4B  curve_pool_offset (u32, byte offset from file start)
+#   4B  band_pool_offset (u32, byte offset from file start)
 #
 # GLYPH DIRECTORY (per glyph, variable size):
 #   4B  codepoint (u32)
