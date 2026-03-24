@@ -21,6 +21,7 @@
 #include "py/objstr.h"
 #include "py/binary.h"
 #include "py/stream.h"
+#include "py/builtin.h"
 
 #include <math.h>
 #include <string.h>
@@ -314,8 +315,8 @@ typedef struct _slugfont_obj_t {
     size_t glyph_entry_size;       // bytes per glyph entry
 } slugfont_obj_t;
 
-// Forward declarations
-static const mp_obj_type_t slugfont_type;
+// Forward declaration — MP_DEFINE_CONST_OBJ_TYPE expands to non-static
+extern const mp_obj_type_t slugfont_type;
 
 // ---- Glyph lookup by codepoint (linear scan — fine for <128 glyphs) ----
 
@@ -351,10 +352,8 @@ static mp_obj_t slugfont_make_new(const mp_obj_type_t *type,
     mp_arg_check_num(n_args, n_kw, 1, 1, false);
 
     // Read file into memory
-    const char *path = mp_obj_str_get_str(args[0]);
-
     mp_obj_t fobj = mp_builtin_open(1, &args[0], (mp_map_t *)&mp_const_empty_map);
-    mp_stream_p_t *stream = (mp_stream_p_t *)mp_get_stream(fobj);
+    const mp_stream_p_t *stream = mp_get_stream(fobj);
 
     // Get file size
     struct mp_stream_seek_t seek = { .offset = 0, .whence = 2 };
@@ -453,7 +452,6 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
     int16_t bx2      = rd_i16(g + 12);
     int16_t by2      = rd_i16(g + 14);
     uint16_t c_off   = rd_u16(g + 16);
-    uint16_t c_cnt   = rd_u16(g + 18);
 
     int adv_px = (int)(advance * scale + 0.5f);
     int gw = bx2 - bx1;
@@ -547,7 +545,6 @@ static mp_obj_t slugfont_render(size_t n_args, const mp_obj_t *args) {
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(args[3], &bufinfo, MP_BUFFER_WRITE);
 
-    int buf_w = mp_obj_get_int(args[4]);
     int pen_x_start = (n_args > 5) ? mp_obj_get_int(args[5]) : 0;
     int pen_y       = (n_args > 6) ? mp_obj_get_int(args[6]) : 0;
 
@@ -594,7 +591,7 @@ static mp_obj_t slugfont_render(size_t n_args, const mp_obj_t *args) {
             mp_obj_new_int((int)(pen_x + 0.5f)),  // x
             mp_obj_new_int(pen_y),                // y
         };
-        mp_obj_t adv_obj = slugfont_render_glyph(7, glyph_args);
+        slugfont_render_glyph(7, glyph_args);
 
         // Advance pen by glyph's actual advance width (not pixel width)
         const uint8_t *g = slugfont_find_glyph(self, cp);
