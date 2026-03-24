@@ -260,6 +260,52 @@ static void trace_vband(const uint8_t *curves, int curve_off,
     *out_wgt = wgt;
 }
 
+// Bandless trace — iterate ALL curves for a glyph (no band lookup)
+// Slower but eliminates all band boundary artifacts
+static void trace_h_all(const uint8_t *curves, int curve_off,
+                         int curve_count, float sx, float sy, float ppe,
+                         float *out_cov, float *out_wgt) {
+    float cov = 0.0f, wgt = 0.0f;
+    for (int i = 0; i < curve_count; i++) {
+        const uint8_t *c = curves + (curve_off + i) * CURVE_FLOATS * 4;
+        float p1x = rd_f32(c)      - sx, p1y = rd_f32(c + 4)  - sy;
+        float p2x = rd_f32(c + 8)  - sx, p2y = rd_f32(c + 12) - sy;
+        float p3x = rd_f32(c + 16) - sx, p3y = rd_f32(c + 20) - sy;
+
+        int use_r1, use_r2;
+        calc_root_code(p1y, p2y, p3y, &use_r1, &use_r2);
+        if (!use_r1 && !use_r2) continue;
+
+        float rx1, rx2;
+        solve_horiz(p1x, p1y, p2x, p2y, p3x, p3y, &rx1, &rx2);
+        if (use_r1) { float r = rx1*ppe; cov += clamp01(r+0.5f); float w = clamp01(1.0f-fabsf(r)*2.0f); if(w>wgt) wgt=w; }
+        if (use_r2) { float r = rx2*ppe; cov -= clamp01(r+0.5f); float w = clamp01(1.0f-fabsf(r)*2.0f); if(w>wgt) wgt=w; }
+    }
+    *out_cov = cov; *out_wgt = wgt;
+}
+
+static void trace_v_all(const uint8_t *curves, int curve_off,
+                         int curve_count, float sx, float sy, float ppe,
+                         float *out_cov, float *out_wgt) {
+    float cov = 0.0f, wgt = 0.0f;
+    for (int i = 0; i < curve_count; i++) {
+        const uint8_t *c = curves + (curve_off + i) * CURVE_FLOATS * 4;
+        float p1x = rd_f32(c)      - sx, p1y = rd_f32(c + 4)  - sy;
+        float p2x = rd_f32(c + 8)  - sx, p2y = rd_f32(c + 12) - sy;
+        float p3x = rd_f32(c + 16) - sx, p3y = rd_f32(c + 20) - sy;
+
+        int use_r1, use_r2;
+        calc_root_code(p1x, p2x, p3x, &use_r1, &use_r2);
+        if (!use_r1 && !use_r2) continue;
+
+        float ry1, ry2;
+        solve_vert(p1x, p1y, p2x, p2y, p3x, p3y, &ry1, &ry2);
+        if (use_r1) { float r = ry1*ppe; cov -= clamp01(r+0.5f); float w = clamp01(1.0f-fabsf(r)*2.0f); if(w>wgt) wgt=w; }
+        if (use_r2) { float r = ry2*ppe; cov += clamp01(r+0.5f); float w = clamp01(1.0f-fabsf(r)*2.0f); if(w>wgt) wgt=w; }
+    }
+    *out_cov = cov; *out_wgt = wgt;
+}
+
 // Lengyel's weighted dual-ray coverage combination
 // weight_boost: apply sqrt() to boost optical weight of thin features.
 // Matches SLUG_WEIGHT define in SlugPixelShader.hlsl.
@@ -461,6 +507,7 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
     int16_t bx2      = rd_i16(g + 12);
     int16_t by2      = rd_i16(g + 14);
     uint16_t c_off   = rd_u16(g + 16);
+    uint16_t c_cnt   = rd_u16(g + 18);
 
     int adv_px = (int)(advance * scale + 0.5f);
     int gw = bx2 - bx1;
@@ -477,17 +524,13 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
     float ppe_x = 1.0f / fu_per_px_x;
     float ppe_y = 1.0f / fu_per_px_y;
 
-    int nb = self->n_bands;
-    float band_h = (float)gh / nb;
-    float band_w = (float)gw / nb;
-
     int baseline_y = (int)(self->ascender * scale + 0.5f);
     int glyph_top = baseline_y - (int)(by2 * scale + 0.5f);
     int glyph_left = (int)(bx + lsb_px + 0.5f);
 
-    // Parse band references for this glyph
-    const uint8_t *band_ptr = g + GLYPH_FIXED_SIZE;
-
+    // Bandless rendering — trace ALL curves per pixel.
+    // No band lookup = no band boundary artifacts.
+    // ~15-25 curves per glyph, fast enough on Cortex-M33 FPv5.
     for (int py = 0; py < gh_px; py++) {
         float ey = (gh_px - 1 - py) * fu_per_px_y;
         int row = by + glyph_top + py;
@@ -496,76 +539,23 @@ static mp_obj_t slugfont_render_glyph(size_t n_args, const mp_obj_t *args) {
         for (int px = 0; px < gw_px; px++) {
             float ex = px * fu_per_px_x;
 
-            // Sample at two offsets and take max — eliminates band boundary gaps
-            // Tiny jitter (1/16 pixel) is enough to dodge exact boundary zeros
-            float best = 0.0f;
-            for (int s = 0; s < 2; s++) {
-                float sx = ex + (s ? 0.0625f * fu_per_px_x : 0.0f);
-                float sy = ey + (s ? 0.0625f * fu_per_px_y : 0.0f);
+            float xcov, xwgt, ycov, ywgt;
+            trace_h_all(self->curve_pool, c_off, c_cnt,
+                        ex, ey, ppe_x, &xcov, &xwgt);
+            trace_v_all(self->curve_pool, c_off, c_cnt,
+                        ex, ey, ppe_y, &ycov, &ywgt);
 
-                int hbi2 = (int)(sy / band_h);
-                if (hbi2 >= nb) hbi2 = nb - 1;
-                if (hbi2 < 0) hbi2 = 0;
-                uint16_t hc = rd_u16(band_ptr + hbi2 * BAND_ENTRY_SIZE);
-                uint16_t hp = rd_u16(band_ptr + hbi2 * BAND_ENTRY_SIZE + 2);
-
-                int vbi = (int)(sx / band_w);
-                if (vbi >= nb) vbi = nb - 1;
-                if (vbi < 0) vbi = 0;
-                int voff = (nb + vbi) * BAND_ENTRY_SIZE;
-                uint16_t vc = rd_u16(band_ptr + voff);
-                uint16_t vp = rd_u16(band_ptr + voff + 2);
-
-                float xcov, xwgt, ycov, ywgt;
-                trace_hband(self->curve_pool, c_off, hc, hp,
-                            self->band_pool, sx, sy, ppe_x, &xcov, &xwgt);
-                trace_vband(self->curve_pool, c_off, vc, vp,
-                            self->band_pool, sx, sy, ppe_y, &ycov, &ywgt);
-                float c = calc_coverage(xcov, ycov, xwgt, ywgt,
-                                        self->weight_boost);
-                if (c > best) best = c;
-            }
+            float coverage = calc_coverage(xcov, ycov, xwgt, ywgt,
+                                          self->weight_boost);
 
             int col = glyph_left + px;
             if (col >= 0 && col < buf_w) {
                 size_t idx = (size_t)row * buf_w + col;
                 if (idx < buf_len) {
-                    int val = (int)(best * 255.0f + 0.5f);
+                    int val = (int)(coverage * 255.0f + 0.5f);
                     if (val > 255) val = 255;
                     if (val > buf[idx]) buf[idx] = (uint8_t)val;
                 }
-            }
-        }
-    }
-
-    // Patch isolated zero pixels inside glyph outlines.
-    // A hole is a zero pixel with 5+ of 8 neighbors filled AND at least 2
-    // strong (>96) cardinal neighbors. This catches interior gaps from the
-    // Slug algorithm without filling counters or creating edge halos.
-    for (int py = 1; py < gh_px - 1; py++) {
-        int row = by + glyph_top + py;
-        if (row < 1 || row >= (int)(buf_len / buf_w) - 1) continue;
-        for (int px = 1; px < gw_px - 1; px++) {
-            int col = glyph_left + px;
-            if (col < 1 || col >= buf_w - 1) continue;
-            size_t idx = (size_t)row * buf_w + col;
-            if (idx >= buf_len || buf[idx] != 0) continue;
-
-            uint8_t up    = buf[idx - buf_w];
-            uint8_t down  = buf[idx + buf_w];
-            uint8_t left  = buf[idx - 1];
-            uint8_t right = buf[idx + 1];
-
-            int n8 = (buf[idx - buf_w - 1] > 0) + (up > 0) +
-                     (buf[idx - buf_w + 1] > 0) + (left > 0) +
-                     (right > 0) + (buf[idx + buf_w - 1] > 0) +
-                     (down > 0) + (buf[idx + buf_w + 1] > 0);
-            int strong_card = (up > 96) + (down > 96) + (left > 96) + (right > 96);
-
-            if (n8 >= 5 && strong_card >= 2) {
-                int card_count = (up > 0) + (down > 0) + (left > 0) + (right > 0);
-                int sum = up + down + left + right;
-                buf[idx] = (card_count > 0) ? (uint8_t)(sum / card_count) : 128;
             }
         }
     }
