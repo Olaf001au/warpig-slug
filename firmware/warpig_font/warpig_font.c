@@ -768,6 +768,124 @@ static mp_obj_t slugfont_bold(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(slugfont_bold_obj, 1, 2, slugfont_bold);
 
 // ============================================================================
+// METHOD: font.render_dither(text, px_size, fbuf_obj, buf_w, x=0, y=0)
+// Obra Dinn-style ordered dithering: render grayscale then compare against
+// 8x8 Bayer matrix to produce 1-bit output directly into a framebuf.
+// Stable, fast (one compare per pixel), no error propagation.
+// ============================================================================
+
+// 8x8 Bayer ordered dither matrix (normalized to 0-255)
+static const uint8_t bayer8x8[64] = {
+      0, 128,  32, 160,   8, 136,  40, 168,
+    192,  64, 224,  96, 200,  72, 232, 104,
+     48, 176,  16, 144,  56, 184,  24, 152,
+    240, 112, 208,  80, 248, 120, 216,  88,
+     12, 140,  44, 172,   4, 132,  36, 164,
+    204,  76, 236, 108, 196,  68, 228, 100,
+     60, 188,  28, 156,  52, 180,  20, 148,
+    252, 124, 220,  92, 244, 116, 212,  84,
+};
+
+// dither(buf, w, h, mode=0, noise=None)
+// In-place Obra Dinn-style ordered dithering.
+// Converts 8-bit grayscale to 0/255 by comparing against a tiling pattern.
+// mode 0 = 8x8 Bayer (fast, slight grid pattern)
+// mode 1 = blue noise (best quality, needs 64x64 noise texture passed as 5th arg)
+// mode 2 = Atkinson error diffusion (high contrast, good for text)
+
+static mp_obj_t slugfont_dither(size_t n_args, const mp_obj_t *args) {
+    (void)args[0]; // self
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_RW);
+    uint8_t *buf = bufinfo.buf;
+    int w = mp_obj_get_int(args[2]);
+    int h = mp_obj_get_int(args[3]);
+    int mode = (n_args > 4) ? mp_obj_get_int(args[4]) : 0;
+    int len = (int)bufinfo.len;
+
+    if (mode == 0) {
+        // Bayer 8x8 ordered dither
+        for (int y = 0; y < h; y++) {
+            int brow = (y & 7) << 3;
+            int row = y * w;
+            if (row >= len) break;
+            for (int x = 0; x < w; x++) {
+                int idx = row + x;
+                if (idx >= len) break;
+                buf[idx] = (buf[idx] > bayer8x8[brow | (x & 7)]) ? 255 : 0;
+            }
+        }
+    } else if (mode == 1 && n_args > 5) {
+        // Blue noise — user passes a noise texture (any size, tiles)
+        mp_buffer_info_t noise_info;
+        mp_get_buffer_raise(args[5], &noise_info, MP_BUFFER_READ);
+        const uint8_t *noise = noise_info.buf;
+        int noise_len = (int)noise_info.len;
+        // Assume square texture, find side length
+        int ns = 1;
+        while (ns * ns < noise_len) ns++;
+        if (ns * ns > noise_len) ns--;
+        if (ns < 2) ns = 64; // fallback
+
+        for (int y = 0; y < h; y++) {
+            int ny = (y % ns) * ns;
+            int row = y * w;
+            if (row >= len) break;
+            for (int x = 0; x < w; x++) {
+                int idx = row + x;
+                if (idx >= len) break;
+                int ni = ny + (x % ns);
+                if (ni < noise_len) {
+                    buf[idx] = (buf[idx] > noise[ni]) ? 255 : 0;
+                }
+            }
+        }
+    } else if (mode == 2) {
+        // Atkinson dither — Apple Macintosh style
+        // Diffuses only 3/4 of error for higher contrast
+        // Works in-place using int promotion
+        int *err = m_malloc(len * sizeof(int));
+        for (int i = 0; i < len; i++) err[i] = buf[i];
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int idx = y * w + x;
+                if (idx >= len) break;
+                int old = err[idx];
+                int new_val = (old > 127) ? 255 : 0;
+                buf[idx] = (uint8_t)new_val;
+                int e = (old - new_val) / 8;  // 1/8 of error to each of 6 neighbors (6/8 = 3/4)
+                // Atkinson distributes to 6 neighbors at 1/8 each
+                if (x+1 < w)                  err[idx+1]     += e;
+                if (x+2 < w)                  err[idx+2]     += e;
+                if (y+1 < h) {
+                    if (x > 0) err[idx+w-1] += e;
+                    err[idx+w] += e;
+                    if (x+1 < w) err[idx+w+1] += e;
+                }
+                if (y+2 < h)                  err[idx+w+w]   += e;
+            }
+        }
+        m_free(err);
+    } else {
+        // Default: Bayer
+        for (int y = 0; y < h; y++) {
+            int brow = (y & 7) << 3;
+            int row = y * w;
+            if (row >= len) break;
+            for (int x = 0; x < w; x++) {
+                int idx = row + x;
+                if (idx >= len) break;
+                buf[idx] = (buf[idx] > bayer8x8[brow | (x & 7)]) ? 255 : 0;
+            }
+        }
+    }
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(slugfont_dither_obj, 4, 6, slugfont_dither);
+
+// ============================================================================
 // TYPE DEFINITION
 // ============================================================================
 
@@ -778,6 +896,7 @@ static const mp_rom_map_elem_t slugfont_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_text_width),   MP_ROM_PTR(&slugfont_text_width_obj) },
     { MP_ROM_QSTR(MP_QSTR_info),         MP_ROM_PTR(&slugfont_info_obj) },
     { MP_ROM_QSTR(MP_QSTR_bold),         MP_ROM_PTR(&slugfont_bold_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dither),        MP_ROM_PTR(&slugfont_dither_obj) },
 };
 static MP_DEFINE_CONST_DICT(slugfont_locals_dict, slugfont_locals_dict_table);
 
